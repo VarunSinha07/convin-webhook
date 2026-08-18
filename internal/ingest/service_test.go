@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/http"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/convin/webhook-ingest/internal/testutil"
@@ -80,5 +81,45 @@ func TestDuplicateDeliveryIsIgnored(t *testing.T) {
 	}
 	if n != 1 {
 		t.Fatalf("stored %d copies of %s, want 1", n, eventID)
+	}
+}
+
+func TestConcurrentDuplicateDeliveriesDoesNotDoubleCount(t *testing.T) {
+	srv, st := testutil.NewServer(t)
+	eventID, callID, accountID := testutil.IDs(t, st)
+	ctx := context.Background()
+
+	body := eventJSON(eventID, callID, accountID)
+
+	const numGoroutines = 10
+	var wg sync.WaitGroup
+	wg.Add(numGoroutines)
+
+	for i := 0; i < numGoroutines; i++ {
+		go func() {
+			defer wg.Done()
+			resp := post(t, srv.URL+"/webhooks/calls", body)
+			if resp.StatusCode != http.StatusOK {
+				t.Errorf("got status %d, want 200", resp.StatusCode)
+			}
+		}()
+	}
+
+	wg.Wait()
+
+	var eventCount int
+	if err := st.Pool().QueryRow(ctx, `SELECT count(*) FROM events WHERE event_id = $1`, eventID).Scan(&eventCount); err != nil {
+		t.Fatalf("scan event count: %v", err)
+	}
+	if eventCount != 1 {
+		t.Fatalf("stored %d copies of event, want 1", eventCount)
+	}
+
+	stats, err := st.AccountStats(ctx, accountID)
+	if err != nil {
+		t.Fatalf("AccountStats: %v", err)
+	}
+	if stats.CallCount != 1 || stats.TotalDurationSec != 143 {
+		t.Fatalf("got stats %+v, want CallCount=1, TotalDurationSec=143", stats)
 	}
 }

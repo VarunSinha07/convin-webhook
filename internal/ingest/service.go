@@ -4,6 +4,7 @@ package ingest
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"log/slog"
 	"time"
 
@@ -37,13 +38,15 @@ func (s *Service) Stats(accountID string) stats.AccountStats {
 // Ingest stores a delivery and kicks off processing. Processing runs
 // asynchronously so the provider gets a fast acknowledgement.
 func (s *Service) Ingest(ctx context.Context, evt Event) error {
-	exists, err := s.store.EventExists(ctx, evt.EventID)
-	if err != nil {
-		return err
-	}
-	if exists {
-		s.log.Info("duplicate delivery ignored", "event_id", evt.EventID)
-		return nil
+	// 1. Fast path: check Redis distributed lock / key cache
+	if s.rdb != nil {
+		set, err := s.rdb.SetNX(ctx, "dedup:event:"+evt.EventID, "1", 24*time.Hour).Result()
+		if err != nil {
+			s.log.Warn("redis deduplication check failed, falling back to postgres", "event_id", evt.EventID, "err", err)
+		} else if !set {
+			s.log.Info("duplicate delivery ignored by redis fast path", "event_id", evt.EventID)
+			return nil
+		}
 	}
 
 	payload, err := json.Marshal(evt)
@@ -61,15 +64,16 @@ func (s *Service) Ingest(ctx context.Context, evt Event) error {
 		OccurredAt:   evt.OccurredAt,
 		Payload:      payload,
 	}
-	if err := s.store.InsertEvent(ctx, rec); err != nil {
+
+	// 2. Durable safety path: Postgres transaction with UNIQUE constraint
+	if err := s.store.IngestTransaction(ctx, rec); err != nil {
+		if errors.Is(err, store.ErrDuplicateEvent) {
+			s.log.Info("duplicate delivery ignored by store", "event_id", evt.EventID)
+			return nil
+		}
 		return err
 	}
-	if err := s.store.UpsertCall(ctx, rec); err != nil {
-		return err
-	}
-	if err := s.store.IncrementAccountStats(ctx, rec.AccountID, rec.DurationSec); err != nil {
-		return err
-	}
+
 	s.cache.Record(rec.AccountID, rec.DurationSec)
 
 	// Recordings are slow to fetch, so that part does not block the provider.

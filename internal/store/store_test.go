@@ -2,6 +2,7 @@ package store_test
 
 import (
 	"context"
+	"errors"
 	"testing"
 
 	"github.com/convin/webhook-ingest/internal/store"
@@ -84,5 +85,25 @@ func TestUpsertCallThenMarkRecordingProcessed(t *testing.T) {
 	}
 	if !processed {
 		t.Fatal("expected recording_processed to be true")
+	}
+}
+
+func TestIngestTransactionRejectsDuplicate(t *testing.T) {
+	s := testutil.NewStore(t)
+	eventID, callID, accountID := testutil.IDs(t, s)
+	ctx := context.Background()
+
+	evt := store.Event{
+		EventID: eventID, CallID: callID, AccountID: accountID,
+		Status: "completed", DurationSec: 10, Payload: []byte(`{}`),
+	}
+
+	if err := s.IngestTransaction(ctx, evt); err != nil {
+		t.Fatalf("first IngestTransaction: %v", err)
+	}
+
+	err := s.IngestTransaction(ctx, evt)
+	if !errors.Is(err, store.ErrDuplicateEvent) {
+		t.Fatalf("second IngestTransaction got %v, want ErrDuplicateEvent", err)
 	}
 }

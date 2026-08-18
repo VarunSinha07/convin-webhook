@@ -31,6 +31,11 @@ func IDs(t *testing.T, s *store.Store) (eventID, callID, accountID string) {
 
 	clean := func() {
 		ctx := context.Background()
+		cfg := config.Load()
+		if rdb, err := redisclient.New(ctx, cfg.RedisAddr); err == nil {
+			_ = rdb.Del(ctx, "dedup:event:"+eventID).Err()
+			_ = rdb.Close()
+		}
 		for _, table := range []string{"events", "calls", "account_stats"} {
 			if _, err := s.Pool().Exec(ctx,
 				"DELETE FROM "+table+" WHERE account_id = $1", accountID); err != nil {
@@ -49,10 +54,21 @@ func IDs(t *testing.T, s *store.Store) (eventID, callID, accountID string) {
 func NewStore(t *testing.T) *store.Store {
 	t.Helper()
 	cfg := config.Load()
-	s, err := store.New(context.Background(), cfg.PostgresDSN, cfg.DBMaxConns)
+	ctx := context.Background()
+	s, err := store.New(ctx, cfg.PostgresDSN, cfg.DBMaxConns)
 	if err != nil {
 		t.Fatalf("connect to postgres (is `docker compose up` running?): %v", err)
 	}
+
+	_, _ = s.Pool().Exec(ctx, `
+		DO $$
+		BEGIN
+			IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'unique_event_id') THEN
+				ALTER TABLE events ADD CONSTRAINT unique_event_id UNIQUE (event_id);
+			END IF;
+		END $$;
+	`)
+
 	t.Cleanup(s.Close)
 	return s
 }

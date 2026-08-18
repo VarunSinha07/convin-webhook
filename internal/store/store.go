@@ -7,8 +7,12 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
+
+// ErrDuplicateEvent is returned when an event with the same EventID has already been ingested.
+var ErrDuplicateEvent = errors.New("duplicate event")
 
 // Event is one call-completion webhook delivery.
 type Event struct {
@@ -113,6 +117,53 @@ func (s *Store) IncrementAccountStats(ctx context.Context, accountID string, dur
 		     total_duration_sec = account_stats.total_duration_sec + EXCLUDED.total_duration_sec`,
 		accountID, durationSec)
 	return err
+}
+
+// IngestTransaction executes event insertion, call upsert, and account stats increment atomically inside a single database transaction.
+func (s *Store) IngestTransaction(ctx context.Context, e Event) error {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	_, err = tx.Exec(ctx,
+		`INSERT INTO events (event_id, call_id, account_id, payload)
+		 VALUES ($1, $2, $3, $4)`,
+		e.EventID, e.CallID, e.AccountID, e.Payload)
+	if err != nil {
+		var pgErr *pgconn.PgError
+		if errors.As(err, &pgErr) && pgErr.Code == "23505" {
+			return ErrDuplicateEvent
+		}
+		return err
+	}
+
+	_, err = tx.Exec(ctx,
+		`INSERT INTO calls (call_id, account_id, status, duration_sec, recording_url, updated_at)
+		 VALUES ($1, $2, $3, $4, $5, now())
+		 ON CONFLICT (call_id) DO UPDATE SET
+		     status        = EXCLUDED.status,
+		     duration_sec  = EXCLUDED.duration_sec,
+		     recording_url = EXCLUDED.recording_url,
+		     updated_at    = now()`,
+		e.CallID, e.AccountID, e.Status, e.DurationSec, e.RecordingURL)
+	if err != nil {
+		return err
+	}
+
+	_, err = tx.Exec(ctx,
+		`INSERT INTO account_stats (account_id, call_count, total_duration_sec)
+		 VALUES ($1, 1, $2)
+		 ON CONFLICT (account_id) DO UPDATE SET
+		     call_count         = account_stats.call_count + 1,
+		     total_duration_sec = account_stats.total_duration_sec + EXCLUDED.total_duration_sec`,
+		e.AccountID, e.DurationSec)
+	if err != nil {
+		return err
+	}
+
+	return tx.Commit(ctx)
 }
 
 // AccountStats reads the durable aggregate. A missing account reads as zero.
