@@ -80,7 +80,7 @@ func (s *Service) Ingest(ctx context.Context, evt Event) error {
 	if rec.RecordingURL != "" {
 		go func() {
 			if err := s.processRecording(ctx, rec); err != nil {
-				// TODO: handle
+				s.log.Error("recording processing failed", "call_id", rec.CallID, "event_id", rec.EventID, "err", err)
 			}
 		}()
 	}
@@ -91,6 +91,10 @@ func (s *Service) Ingest(ctx context.Context, evt Event) error {
 // processRecording downloads and transcodes the call recording, then marks
 // the call as done.
 func (s *Service) processRecording(ctx context.Context, rec store.Event) error {
+	// Detach from HTTP request context cancellation, but enforce a processing timeout.
+	bgCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
+	defer cancel()
+
 	time.Sleep(recordingWork)
-	return s.store.MarkRecordingProcessed(ctx, rec.CallID)
+	return s.store.MarkRecordingProcessed(bgCtx, rec.CallID)
 }

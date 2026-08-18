@@ -7,6 +7,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/convin/webhook-ingest/internal/testutil"
 )
@@ -121,5 +122,40 @@ func TestConcurrentDuplicateDeliveriesDoesNotDoubleCount(t *testing.T) {
 	}
 	if stats.CallCount != 1 || stats.TotalDurationSec != 143 {
 		t.Fatalf("got stats %+v, want CallCount=1, TotalDurationSec=143", stats)
+	}
+}
+
+func TestRecordingProcessedEvenWhenContextCanceled(t *testing.T) {
+	srv, st := testutil.NewServer(t)
+	eventID, callID, accountID := testutil.IDs(t, st)
+
+	reqCtx, cancel := context.WithCancel(context.Background())
+
+	body := eventJSON(eventID, callID, accountID)
+	req, err := http.NewRequestWithContext(reqCtx, http.MethodPost, srv.URL+"/webhooks/calls", strings.NewReader(body))
+	if err != nil {
+		t.Fatalf("NewRequestWithContext: %v", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("do post: %v", err)
+	}
+	_ = resp.Body.Close()
+
+	// Cancel context immediately to simulate HTTP handler finish
+	cancel()
+
+	// Wait for recordingWork (50ms) to complete
+	time.Sleep(100 * time.Millisecond)
+
+	var processed bool
+	row := st.Pool().QueryRow(context.Background(), `SELECT recording_processed FROM calls WHERE call_id = $1`, callID)
+	if err := row.Scan(&processed); err != nil {
+		t.Fatalf("scan recording_processed: %v", err)
+	}
+	if !processed {
+		t.Fatal("expected recording_processed to be true despite request context cancellation")
 	}
 }
