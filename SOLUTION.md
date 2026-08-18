@@ -21,7 +21,16 @@
   1. Detached recording processing from HTTP request context cancellation using `context.WithoutCancel(ctx)` with a 10-second background processing timeout context.
   2. Added explicit error logging (`s.log.Error("recording processing failed", ...)`) if recording processing encounters an issue.
 
-*Note: Documentation for Defect 3 (Graceful Shutdown In-flight Task Loss) will be updated as Phase 3 is implemented.*
+### Defect 3: Loss of In-flight Async Work During Server Graceful Shutdown
+- **Symptom**: On deployment or restart, whatever async recording work was in-flight disappeared.
+- **Root Cause**:
+  1. In `cmd/server/main.go`, upon receiving `SIGTERM` / `SIGINT`, `srv.Shutdown(shutdownCtx)` was called to gracefully stop the HTTP server.
+  2. Because the HTTP handler (`postCallWebhook`) returned HTTP 200 immediately after spawning background goroutines, zero HTTP handlers were active when `srv.Shutdown` ran.
+  3. `srv.Shutdown` finished almost instantaneously, and `main()` exited immediately, terminating the process and abruptly killing background recording goroutines (`recordingWork = 50ms`) mid-execution before they could complete.
+- **Fix**:
+  1. Added a `sync.WaitGroup` to `ingest.Service` to track active background recording goroutines (`s.wg.Add(1)` / `defer s.wg.Done()`).
+  2. Exported a `Shutdown(ctx context.Context) error` method on `ingest.Service` that blocks until all background workers finish (or until `shutdownCtx` deadline expires).
+  3. Updated `cmd/server/main.go` to call `svc.Shutdown(shutdownCtx)` after HTTP server shutdown completes.
 
 ---
 
